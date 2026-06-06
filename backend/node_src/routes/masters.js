@@ -59,32 +59,136 @@ router.get('/machines/:id/processes', (req, res) => {
   res.json({ processes });
 });
 
+// Strip trailing "NO.1 / NO 1 / 01 / M/C 1" style suffix to derive a machine "type"
+function machineType(name) {
+  if (!name) return '';
+  let s = String(name).trim().toUpperCase();
+  // Remove trailing optional "NO." or "#" + spaces + digits
+  s = s.replace(/\s+(NO\.?|#)?\s*\.?\s*\d+\s*$/g, '');
+  return s.trim();
+}
+
+// Find machine column / details column / process-code column / process-desc column
+function detectColumns(headers) {
+  const lower = headers.map((h) => h.toLowerCase());
+  const find = (re) => {
+    const i = lower.findIndex((h) => re.test(h));
+    return i >= 0 ? headers[i] : null;
+  };
+  // 4-column layout (M/C code, M/C details, Proc code, Proc desc)
+  const machineNoCol =
+    find(/m\/?c.*(no|number|code)/) || find(/machine.*(no|number|code)/) || find(/^mc/);
+  const machineNameCol =
+    find(/process.*m\/?c.*detail/) ||
+    find(/m\/?c.*(detail|desc|name)/) ||
+    find(/machine.*(name|detail|desc)/);
+  const procCodeCol = find(/proc.*(cd|code)/) || find(/^pcode/);
+  const procNameCol = find(/proc.*(desc|name|type)/);
+
+  if (machineNoCol && procCodeCol && procNameCol) {
+    return { mode: 'full4', machineNoCol, machineNameCol, procCodeCol, procNameCol };
+  }
+  // 2-column fallback (Machine, Process)
+  const machineCol = find(/machine/);
+  const processCol = find(/process/);
+  if (machineCol && processCol) return { mode: 'simple2', machineCol, processCol };
+  return null;
+}
+
 router.post('/import', requireRole('admin'), upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
 
+  // XLSX.read handles both Excel and CSV when given a buffer
   let workbook;
   try {
     workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
   } catch (e) {
-    return res.status(400).json({ error: 'Invalid Excel file' });
+    return res.status(400).json({ error: 'Invalid file: could not parse as Excel or CSV' });
   }
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-  if (!rows.length) return res.status(400).json({ error: 'Sheet is empty' });
+  if (!rows.length) return res.status(400).json({ error: 'File is empty' });
 
-  // Detect column names case-insensitively
-  const headers = Object.keys(rows[0]);
-  const machineCol = headers.find((h) => /machine/i.test(h));
-  const processCol = headers.find((h) => /process/i.test(h));
-  if (!machineCol || !processCol) {
+  const cols = detectColumns(Object.keys(rows[0]));
+  if (!cols) {
     return res
       .status(400)
-      .json({ error: 'Could not detect machine and process columns in the sheet' });
+      .json({ error: 'Could not detect required columns. Expected either (Machine,Process) or (M/C Code, M/C Details, Proc Code, Proc Desc).' });
   }
 
+  // Step 1: Parse rows into machines map.
+  //   machineNo -> { name, processes: Map<process_code, process_name> }
+  // Continuation rows (empty machine_no) attach to previously seen machine in the file.
+  const machinesMap = new Map(); // preserves insertion order
+  let lastMachineNo = null;
+
+  for (const row of rows) {
+    let machineNo, machineName, procCode, procName;
+    if (cols.mode === 'full4') {
+      machineNo = String(row[cols.machineNoCol] || '').trim();
+      machineName = String(row[cols.machineNameCol] || '').trim();
+      procCode = String(row[cols.procCodeCol] || '').trim();
+      procName = String(row[cols.procNameCol] || '').trim();
+    } else {
+      machineNo = String(row[cols.machineCol] || '').trim();
+      machineName = machineNo;
+      procName = String(row[cols.processCol] || '').trim();
+      procCode = procName ? procName.toUpperCase().replace(/\s+/g, '_') : '';
+    }
+
+    // Continuation row: empty machine no → reuse the previous machine
+    const effectiveMachineNo = machineNo || lastMachineNo;
+    if (!effectiveMachineNo) continue;
+
+    if (!machinesMap.has(effectiveMachineNo)) {
+      machinesMap.set(effectiveMachineNo, {
+        machine_no: effectiveMachineNo,
+        machine_name: machineName || effectiveMachineNo,
+        processes: new Map(), // process_code -> process_name
+      });
+    } else if (machineNo && machineName) {
+      // Update name on first proper row
+      const existing = machinesMap.get(effectiveMachineNo);
+      if (!existing.machine_name || existing.machine_name === existing.machine_no) {
+        existing.machine_name = machineName;
+      }
+    }
+
+    if (procCode && procName) {
+      machinesMap.get(effectiveMachineNo).processes.set(procCode, procName);
+    }
+    if (machineNo) lastMachineNo = machineNo;
+  }
+
+  // Step 2: Compute inheritance groups by machine "type"
+  // type -> Map<process_code, process_name>
+  const typeProcesses = new Map();
+  for (const m of machinesMap.values()) {
+    const t = machineType(m.machine_name);
+    if (!t) continue;
+    if (!typeProcesses.has(t)) typeProcesses.set(t, new Map());
+    const bucket = typeProcesses.get(t);
+    for (const [code, name] of m.processes) bucket.set(code, name);
+  }
+
+  // Step 3: For machines with no processes, inherit from siblings of same type
+  let inheritedCount = 0;
+  for (const m of machinesMap.values()) {
+    if (m.processes.size > 0) continue;
+    const t = machineType(m.machine_name);
+    const bucket = typeProcesses.get(t);
+    if (bucket && bucket.size) {
+      for (const [code, name] of bucket) m.processes.set(code, name);
+      inheritedCount++;
+    }
+  }
+
+  // Step 4: Bulk insert
   const insertMachine = db.prepare(
     'INSERT OR IGNORE INTO machines (machine_no, machine_name, is_active) VALUES (?, ?, 1)'
+  );
+  const updateMachineName = db.prepare(
+    'UPDATE machines SET machine_name = ? WHERE machine_no = ? AND (machine_name IS NULL OR machine_name = machine_no)'
   );
   const insertProcess = db.prepare(
     'INSERT OR IGNORE INTO process_types (process_code, process_name, is_active) VALUES (?, ?, 1)'
@@ -95,33 +199,69 @@ router.post('/import', requireRole('admin'), upload.single('file'), (req, res) =
     'INSERT OR IGNORE INTO machine_processes (machine_id, process_type_id) VALUES (?, ?)'
   );
 
-  let processed = 0;
-  let skipped = 0;
+  let machinesAdded = 0;
+  let processesAdded = 0;
+  let mappingsAdded = 0;
+  const machinesWithoutProcesses = [];
 
-  const txn = db.transaction((rows) => {
-    for (const row of rows) {
-      const machineNo = String(row[machineCol] || '').trim();
-      const processName = String(row[processCol] || '').trim();
-      if (!machineNo || !processName) {
-        skipped++;
+  const txn = db.transaction(() => {
+    for (const m of machinesMap.values()) {
+      const info = insertMachine.run(m.machine_no, m.machine_name || m.machine_no);
+      if (info.changes) machinesAdded++;
+      else updateMachineName.run(m.machine_name, m.machine_no);
+
+      if (m.processes.size === 0) {
+        machinesWithoutProcesses.push(`${m.machine_no} (${m.machine_name})`);
         continue;
       }
-      insertMachine.run(machineNo, machineNo);
-      const processCode = processName.toUpperCase().replace(/\s+/g, '_');
-      insertProcess.run(processCode, processName);
-      const m = getMachineId.get(machineNo);
-      const p = getProcessId.get(processCode);
-      if (m && p) {
-        insertMapping.run(m.id, p.id);
-        processed++;
-      } else {
-        skipped++;
+      for (const [procCode, procName] of m.processes) {
+        const pInfo = insertProcess.run(procCode, procName);
+        if (pInfo.changes) processesAdded++;
+        const mid = getMachineId.get(m.machine_no);
+        const pid = getProcessId.get(procCode);
+        if (mid && pid) {
+          const mapInfo = insertMapping.run(mid.id, pid.id);
+          if (mapInfo.changes) mappingsAdded++;
+        }
       }
     }
   });
-  txn(rows);
+  txn();
 
-  res.json({ success: true, processed, skipped, total: rows.length });
+  res.json({
+    success: true,
+    totalRows: rows.length,
+    machines: machinesMap.size,
+    machinesAdded,
+    processesAdded,
+    mappingsAdded,
+    inheritedMachines: inheritedCount,
+    machinesWithoutProcesses,
+    // Legacy fields for older clients
+    processed: mappingsAdded,
+    skipped: machinesWithoutProcesses.length,
+  });
+});
+
+// Admin: wipe all master data (machines, processes, mappings).
+// Scan history (scan_records, scan_sessions) is preserved by default.
+router.post('/reset', requireRole('admin'), (req, res) => {
+  const wipeHistory = req.query.wipe_history === '1';
+  db.exec('BEGIN');
+  try {
+    db.exec('DELETE FROM machine_processes');
+    if (wipeHistory) {
+      db.exec('DELETE FROM scan_records');
+      db.exec('DELETE FROM scan_sessions');
+    }
+    db.exec('DELETE FROM machines');
+    db.exec('DELETE FROM process_types');
+    db.exec('COMMIT');
+    res.json({ success: true, wipedHistory: wipeHistory });
+  } catch (e) {
+    db.exec('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;
