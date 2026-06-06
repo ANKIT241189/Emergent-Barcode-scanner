@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Check, AlertTriangle, ArrowLeft, RotateCcw, ScanLine } from "lucide-react";
+import BarcodeScanner from "@/components/BarcodeScanner";
 
 const STEPS = [
   { id: 1, label: "Scan Machine" },
@@ -129,9 +130,9 @@ export default function ScanPage() {
     }
   };
 
-  const recordScan = async (e) => {
-    e.preventDefault();
-    const code = batchInput.trim();
+  const recordScan = async (e, codeOverride) => {
+    if (e?.preventDefault) e.preventDefault();
+    const code = (codeOverride ?? batchInput).trim();
     if (!code || !session) return;
     setBusy(true);
     try {
@@ -184,19 +185,28 @@ export default function ScanPage() {
           <CardContent>
             <form onSubmit={lookupMachine} className="space-y-3">
               <Label htmlFor="machine-barcode">Machine Barcode</Label>
-              <Input
-                id="machine-barcode"
-                data-testid="machine-barcode-input"
-                ref={machineRef}
-                value={machineInput}
-                onChange={(e) => setMachineInput(e.target.value)}
-                placeholder="Scan or type machine barcode and press Enter"
-                className="text-lg h-12"
-                autoFocus
-                disabled={busy}
-              />
+              <div className="flex gap-2">
+                <Input
+                  id="machine-barcode"
+                  data-testid="machine-barcode-input"
+                  ref={machineRef}
+                  value={machineInput}
+                  onChange={(e) => setMachineInput(e.target.value)}
+                  placeholder="Scan or type machine barcode and press Enter"
+                  className="text-lg h-12 flex-1"
+                  autoFocus
+                  disabled={busy}
+                />
+                <BarcodeScanner
+                  testId="machine-camera-scanner"
+                  label="Camera"
+                  buttonClassName="h-12"
+                  onDetected={(code) => lookupMachine(null, code)}
+                />
+              </div>
               <div className="text-xs text-slate-500">
-                The Honeywell scanner will auto-submit on Enter.
+                Honeywell USB scanner auto-submits on Enter. Or tap{" "}
+                <span className="font-medium">Camera</span> to scan with your phone camera.
               </div>
               <Button
                 type="submit"
@@ -322,17 +332,25 @@ export default function ScanPage() {
             <CardContent>
               <form onSubmit={recordScan} className="space-y-3">
                 <Label htmlFor="batch-barcode">Batch Card Barcode</Label>
-                <Input
-                  id="batch-barcode"
-                  data-testid="batch-barcode-input"
-                  ref={batchRef}
-                  value={batchInput}
-                  onChange={(e) => setBatchInput(e.target.value)}
-                  placeholder="Scan batch card barcode and press Enter"
-                  className="text-lg h-12"
-                  autoFocus
-                  disabled={busy}
-                />
+                <div className="flex gap-2">
+                  <Input
+                    id="batch-barcode"
+                    data-testid="batch-barcode-input"
+                    ref={batchRef}
+                    value={batchInput}
+                    onChange={(e) => setBatchInput(e.target.value)}
+                    placeholder="Scan batch card barcode and press Enter"
+                    className="text-lg h-12 flex-1"
+                    autoFocus
+                    disabled={busy}
+                  />
+                  <BarcodeScanner
+                    testId="batch-camera-scanner"
+                    label="Camera"
+                    buttonClassName="h-12"
+                    onDetected={(code) => recordScan(null, code)}
+                  />
+                </div>
               </form>
 
               <div className="mt-5">

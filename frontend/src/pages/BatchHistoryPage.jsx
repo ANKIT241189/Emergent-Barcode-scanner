@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Search, Cog, User, Calendar } from "lucide-react";
 import { toast } from "sonner";
+import BarcodeScanner from "@/components/BarcodeScanner";
 
 export default function BatchHistoryPage() {
   const [code, setCode] = useState("");
@@ -13,10 +14,11 @@ export default function BatchHistoryPage() {
   const [busy, setBusy] = useState(false);
   const inputRef = useRef(null);
 
-  const search = async (e) => {
-    e.preventDefault();
-    const q = code.trim();
+  const search = async (e, codeOverride) => {
+    if (e?.preventDefault) e.preventDefault();
+    const q = (codeOverride ?? code).trim();
     if (!q) return;
+    setCode(q);
     setBusy(true);
     try {
       const r = await axios.get(`${API}/scans/batch/${encodeURIComponent(q)}`);
@@ -51,6 +53,12 @@ export default function BatchHistoryPage() {
               data-testid="batch-search-input"
               autoFocus
               className="text-lg h-12"
+            />
+            <BarcodeScanner
+              testId="history-camera-scanner"
+              label="Camera"
+              buttonClassName="h-12"
+              onDetected={(c) => search(null, c)}
             />
             <Button
               type="submit"
