@@ -25,10 +25,22 @@ const FORMATS = [
   Html5QrcodeSupportedFormats.DATA_MATRIX,
 ];
 
+const waitForElement = (id, maxTries = 40) =>
+  new Promise((resolve) => {
+    let tries = 0;
+    const tick = () => {
+      const el = document.getElementById(id);
+      if (el) return resolve(el);
+      if (++tries >= maxTries) return resolve(null);
+      requestAnimationFrame(tick);
+    };
+    tick();
+  });
+
 /**
  * Mobile / desktop camera barcode scanner.
- * Opens a modal with a live viewfinder; calls onDetected(code) with the first
- * successful decode, then auto-closes.
+ * Opens a dialog with a live viewfinder. Calls onDetected(code) with the first
+ * successful decode and then closes. Robust against open / close / re-open cycles.
  */
 export default function BarcodeScanner({
   onDetected,
@@ -38,7 +50,7 @@ export default function BarcodeScanner({
   variant = "outline",
   size = "default",
 }) {
-  // Unique DOM id per instance — multiple scanners can live on the same page.
+  // Per-instance unique DOM id (multiple scanners can live on the same page).
   const reactId = useId().replace(/:/g, "");
   const elementId = `pb-cam-${reactId}`;
 
@@ -46,105 +58,117 @@ export default function BarcodeScanner({
   const [error, setError] = useState(null);
   const [cameras, setCameras] = useState([]);
   const [activeCamId, setActiveCamId] = useState(null);
-  const [ready, setReady] = useState(false); // true once the target div exists in DOM
-  const html5QrRef = useRef(null);
-  const startedRef = useRef(false);
-  const containerRef = useRef(null);
 
-  const stop = async () => {
-    if (html5QrRef.current && startedRef.current) {
-      try {
-        await html5QrRef.current.stop();
-      } catch {}
-      startedRef.current = false;
-    }
-    if (html5QrRef.current) {
-      try {
-        await html5QrRef.current.clear();
-      } catch {}
-      html5QrRef.current = null;
-    }
-  };
+  // We do NOT track readiness in state — the effect itself waits for the element.
+  const scannerRef = useRef(null); // current Html5Qrcode instance
+  const cancelRef = useRef(false); // session-level cancel flag
 
-  const start = async (camId) => {
-    if (!html5QrRef.current) return;
-    setError(null);
+  const teardown = async () => {
+    const s = scannerRef.current;
+    scannerRef.current = null;
+    if (!s) return;
     try {
-      await html5QrRef.current.start(
-        camId || { facingMode: { ideal: "environment" } },
-        {
-          fps: 12,
-          qrbox: (vw, vh) => {
-            const m = Math.min(vw, vh);
-            return { width: Math.floor(m * 0.85), height: Math.floor(m * 0.55) };
-          },
-          aspectRatio: 1.6,
-          formatsToSupport: FORMATS,
-        },
-        (decodedText) => {
-          onDetected(decodedText);
-          setOpen(false);
-        },
-        () => {} // per-frame "not found" errors — ignore
-      );
-      startedRef.current = true;
-    } catch (e) {
-      setError(
-        e?.message ||
-          "Unable to start camera. Grant camera permission and use a secure (https) connection."
-      );
-    }
+      // stop() throws if it was never started — ignore.
+      await s.stop();
+    } catch {}
+    try {
+      await s.clear();
+    } catch {}
   };
 
-  // Initialize once the dialog has rendered the target div in the DOM.
+  const startScanner = async (scanner, camId) => {
+    await scanner.start(
+      camId || { facingMode: { ideal: "environment" } },
+      {
+        fps: 12,
+        qrbox: (vw, vh) => {
+          const m = Math.min(vw, vh);
+          return { width: Math.floor(m * 0.85), height: Math.floor(m * 0.55) };
+        },
+        aspectRatio: 1.6,
+        formatsToSupport: FORMATS,
+      },
+      async (decodedText) => {
+        // Hand the value to the parent and immediately tear down so the next
+        // open is a clean slate. Closing the dialog will also trigger teardown,
+        // but we do it first to avoid races during the very next open.
+        try {
+          onDetected(decodedText);
+        } finally {
+          setOpen(false);
+        }
+      },
+      () => {} // per-frame "not found" events — ignore
+    );
+  };
+
+  // Main lifecycle: when the dialog opens, find the (just-mounted) target div,
+  // create a fresh Html5Qrcode instance, enumerate cameras and start.
   useEffect(() => {
-    if (!open || !ready) return;
-    let cancelled = false;
+    if (!open) return;
+    cancelRef.current = false;
+    setError(null);
 
     (async () => {
-      try {
-        if (!document.getElementById(elementId)) {
-          setError("Camera UI failed to attach.");
-          return;
-        }
-        html5QrRef.current = new Html5Qrcode(elementId, { formatsToSupport: FORMATS });
+      const target = await waitForElement(elementId);
+      if (cancelRef.current) return;
+      if (!target) {
+        setError("Camera UI failed to attach.");
+        return;
+      }
 
-        let devs = [];
-        try {
-          devs = await Html5Qrcode.getCameras();
-        } catch (e) {
-          // some browsers throw if no permission yet — we'll fall back to facingMode
-        }
-        if (cancelled) return;
-        setCameras(devs || []);
-        const back = (devs || []).find((d) => /back|rear|environment/i.test(d.label));
-        const startCam = back?.id || devs?.[0]?.id || null;
-        setActiveCamId(startCam);
-        await start(startCam);
+      // Safety: if a stale scanner is still around for any reason, wipe it.
+      if (scannerRef.current) {
+        try { await scannerRef.current.stop(); } catch {}
+        try { await scannerRef.current.clear(); } catch {}
+        scannerRef.current = null;
+      }
+      // The div might have been left non-empty by a previous library teardown
+      // in an edge case — make sure it's pristine before constructing.
+      target.innerHTML = "";
+
+      let scanner;
+      try {
+        scanner = new Html5Qrcode(elementId, { formatsToSupport: FORMATS });
       } catch (e) {
-        if (cancelled) return;
-        setError(
-          e?.message ||
-            "Cannot access the camera. Check permissions and a secure (https) URL."
-        );
+        setError(e?.message || "Camera UI failed to attach.");
+        return;
+      }
+      if (cancelRef.current) {
+        try { await scanner.clear(); } catch {}
+        return;
+      }
+      scannerRef.current = scanner;
+
+      let devs = [];
+      try {
+        devs = await Html5Qrcode.getCameras();
+      } catch {
+        /* permission may not be granted yet — facingMode fallback will be used */
+      }
+      if (cancelRef.current) return;
+      setCameras(devs || []);
+      const back = (devs || []).find((d) => /back|rear|environment/i.test(d.label));
+      const startCam = back?.id || devs?.[0]?.id || null;
+      setActiveCamId(startCam);
+
+      try {
+        await startScanner(scanner, startCam);
+      } catch (e) {
+        if (!cancelRef.current) {
+          setError(
+            e?.message ||
+              "Unable to start camera. Grant camera permission and use a secure (https) connection."
+          );
+        }
       }
     })();
 
     return () => {
-      cancelled = true;
-      stop();
+      cancelRef.current = true;
+      teardown();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, ready]);
-
-  // Reset state whenever the dialog closes
-  useEffect(() => {
-    if (!open) {
-      setReady(false);
-      setError(null);
-      setCameras([]);
-      setActiveCamId(null);
-    }
   }, [open]);
 
   const switchCamera = async () => {
@@ -152,16 +176,12 @@ export default function BarcodeScanner({
     const idx = cameras.findIndex((c) => c.id === activeCamId);
     const next = cameras[(idx + 1) % cameras.length];
     setActiveCamId(next.id);
-    await stop();
-    if (!document.getElementById(elementId)) return;
-    html5QrRef.current = new Html5Qrcode(elementId, { formatsToSupport: FORMATS });
-    await start(next.id);
-  };
-
-  // Callback ref runs the moment React attaches the div to the DOM.
-  const attachRef = (el) => {
-    containerRef.current = el;
-    if (el && !ready) setReady(true);
+    const s = scannerRef.current;
+    if (!s) return;
+    try { await s.stop(); } catch {}
+    try { await startScanner(s, next.id); } catch (e) {
+      setError(e?.message || "Failed to switch camera");
+    }
   };
 
   return (
@@ -186,7 +206,7 @@ export default function BarcodeScanner({
         </DialogHeader>
 
         <div className="relative bg-black">
-          <div id={elementId} ref={attachRef} className="w-full" style={{ minHeight: 280 }} />
+          <div id={elementId} className="w-full" style={{ minHeight: 280 }} />
           {error && (
             <div className="absolute inset-0 flex items-center justify-center p-4 text-center text-sm text-white bg-black/80">
               {error}
